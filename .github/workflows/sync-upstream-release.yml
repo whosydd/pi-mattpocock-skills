@@ -1,0 +1,112 @@
+name: Sync upstream release
+
+# Keeps this fork at upstream release points: main tracks mattpocock/skills
+# releases, not every commit on their main.
+# GitHub's release trigger only fires for this repository, so the job polls
+# upstream's latest release once a day and merges it when the tag is not an
+# ancestor of main yet. Manual runs can pin a tag through workflow_dispatch.
+
+on:
+  schedule:
+    # 02:23 UTC daily. The odd minute avoids the top-of-hour cron rush.
+    - cron: "23 2 * * *"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Upstream release tag to sync. Leave empty for the latest release.
+        required: false
+        default: ""
+
+concurrency:
+  group: sync-upstream-release
+  cancel-in-progress: false
+
+permissions: {}
+
+jobs:
+  sync:
+    name: Merge upstream release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      UPSTREAM_REPO: mattpocock/skills
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # The ancestor check and the merge need full history.
+          fetch-depth: 0
+
+      - name: Resolve upstream release tag
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_TAG: ${{ github.event.inputs.tag }}
+        run: |
+          if [ -n "$INPUT_TAG" ]; then
+            tag="$INPUT_TAG"
+          else
+            tag="$(gh api "repos/$UPSTREAM_REPO/releases/latest" --jq .tag_name)"
+          fi
+          echo "Upstream release: $UPSTREAM_REPO@$tag"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+      - name: Fetch upstream tag
+        env:
+          TAG: ${{ steps.release.outputs.tag }}
+        run: |
+          git remote add upstream "https://github.com/$UPSTREAM_REPO.git"
+          # The leading + force-updates the ref if upstream ever re-tags.
+          git fetch upstream --no-tags "+refs/tags/$TAG:refs/tags/$TAG"
+
+      - name: Skip when the tag is already in main
+        id: check
+        env:
+          TAG: ${{ steps.release.outputs.tag }}
+        run: |
+          if git merge-base --is-ancestor "$TAG" HEAD; then
+            echo "$TAG is already an ancestor of main. Nothing to sync."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Merge upstream release
+        if: steps.check.outputs.skip == 'false'
+        env:
+          TAG: ${{ steps.release.outputs.tag }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if ! git merge --no-ff --no-commit "$TAG"; then
+            git merge --abort || true
+            echo "::error title=Merge conflict::Merging $TAG into main hit conflicts. Resolve manually: git fetch upstream && git merge $TAG"
+            exit 1
+          fi
+          git commit -m "chore: sync upstream release $TAG" -m "Merges $UPSTREAM_REPO@$TAG. The sync job runs only when upstream publishes a release, so main tracks upstream release points instead of every upstream commit."
+
+      - name: Verify the pi skills whitelist still resolves
+        if: steps.check.outputs.skip == 'false'
+        run: |
+          node -e '
+            const { globSync } = require("node:fs");
+            const pkg = require("./package.json");
+            const patterns = pkg.pi?.skills ?? [];
+            if (patterns.length === 0) {
+              console.error("package.json has no pi.skills whitelist.");
+              process.exit(1);
+            }
+            for (const pattern of patterns) {
+              const matches = globSync(pattern, { cwd: "." });
+              if (matches.length === 0) {
+                console.error(`pi.skills pattern "${pattern}" matched no SKILL.md files. Upstream may have renamed or restructured the skill buckets.`);
+                process.exit(1);
+              }
+              console.log(`${pattern} -> ${matches.length} SKILL.md files`);
+            }
+          '
+
+      - name: Push
+        if: steps.check.outputs.skip == 'false'
+        run: git push origin main
