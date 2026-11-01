@@ -8,6 +8,12 @@
     "url": "https://github.com/mattpocock/skills"
   },
   "license": "MIT",
+  "pi": {
+    "skills": [
+      "./skills/engineering/**/SKILL.md",
+      "./skills/productivity/**/SKILL.md"
+    ]
+  },
   "scripts": {
     "changeset": "changeset",
     "version": "changeset version && node scripts/sync-plugin-version.mjs",
